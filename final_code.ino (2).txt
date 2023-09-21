@@ -1,0 +1,364 @@
+#include <SPI.h> // ДЛЯ ПЕРЕДАЧИ ДАННЫХ ПО ШИНЕ SPI (для шилдов)
+#include <DHT.h> //DHT 22 - ДАТЧИК ТЕМП ВЛАЖНОСТИ
+#include <iarduino_RTC.h> // Clock - ДАТЧИК ВРЕМЕНИ
+
+#include "Nextion.h" // не используется
+#include <NexButton.h> 
+#include <NexText.h>
+
+
+/* sensors assign:
+  ===============DIGITAL(цифровые пины)=================
+  temperature sensor (DHT датчик температуры и влажности) pin: 2
+  co2(кислород) pin: 3
+  lamps(лампы) pin: 4,5,10
+  time(датчик времени) pin: (RST: 8, DAT: 7, CLK: 6) - распиновка на датчике времени(желательно подключать там)
+  pump(насос) pin: 9
+  ===============ANALOG(аналоговые)==================
+  floater(поплавок) pin: A1
+  photoresistor(фоторезистор) pin: A0
+*/
+
+// шаблон форматирования времени, STRING - строковый тип 
+String timePattern = "H:i, d-m-Y"; 
+
+// photoresistor
+const int photoresistor = A0;
+
+// dht sensors 
+DHT dht(2, DHT22);
+float humm = 0, temp = 0;
+
+// мин и макс допустимая температура и влажность
+float tempMin = 20.0, tempMax = 23.0;
+float hummMin = 40.0, hummMax = 60.0;
+
+// lamps (для двух ламп)
+const int lamp1 = 4, lamp2 = 5, lamp3 = 10;
+int light_level; // переменная уровеня освещения 
+
+// time (RST: 8, DAT: 7, CLK: 6)
+iarduino_RTC rtc(RTC_DS1302, 8, 6, 7); // это класс, создаем тут новый экземпляр класса и передаем ему параметры. класс библиотеки,через который происходит иницилизация
+
+// CO2 переменные
+const int co2 = 3;
+int prevVal = 0;
+long th, tl, h, l, co2Level;
+
+// floater попловок 
+const int floater = A1;
+
+// pump (насос) variables
+const int pump = 9;
+
+// 3600000 milliseconds in 1 hour, 60000 milliseconds in minute
+const long delayTime = 1230000; // 20 min 30s
+const long wateringTime = 205000; // 3 min 25s
+long TempWateringTime = wateringTime; // текущее время полива (служебные переменные, их не стоит изменять)
+long TempDelayTime = delayTime; // текущее время задерки (служебные переменные, их не стоит изменять)
+bool isWatering = false; // показывает идет ли полив
+
+bool newInfo = false; // пришла ли какая-то инф с сервера
+
+// переменные, отвечающие за ручное управление (на сервере). насос и две лампы. BOOL - потому что у нас условие либо true либо false
+// lamp1
+bool manuallyLightON1 = false;
+bool manuallyLightOFF1 = false;
+// lamp2
+bool manuallyLightON2 = false;
+bool manuallyLightOFF2 = false;
+// lamp3
+bool manuallyLightON3 = false;
+bool manuallyLightOFF3 = false;
+
+// pump
+bool manuallyPumpON = false;
+bool manuallyPumpOFF = false;
+
+// сигнализирует есть ли подсветка или нет
+bool isLighting = false; 
+// lamps initially works in auto mode
+bool manuallyLampsWork = true;
+
+// Declare your Nextion objects - Example (page id = 0, component id = 1, component name = "b0") 
+
+NexText nxtTemp = NexText(0, 1, "tmp");
+NexText nxtHumm = NexText(0, 2, "hm");
+NexText nxtLight = NexText(0, 3, "lt");
+NexText nxtCO2 = NexText(0, 4, "co2");
+NexText nxtWat = NexText(0, 5, "wat");
+NexText nxtTime = NexText(0, 6, "dt");
+
+NexButton nxtLight1BtnON = NexButton(1, 7, "l1btnOn");
+NexButton nxtLight1BtnOFF = NexButton(1, 8, "l1btnOff");
+NexButton nxtLight1BtnA = NexButton(1, 9, "l1btnA");
+
+NexButton nxtLight2BtnON = NexButton(1, 10, "l2btnOn");
+NexButton nxtLight2BtnOFF = NexButton(1, 11, "l2btnOff");
+NexButton nxtLight2BtnA = NexButton(1, 12, "l2btnA");
+
+NexButton nxtLight3BtnON = NexButton(1, 13, "l2btnOn");
+NexButton nxtLight3BtnOFF = NexButton(1, 14, "l2btnOff");
+NexButton nxtLight3BtnA = NexButton(1, 15, "l2btnA");
+
+NexButton nxtPumpBtnON = NexButton(1, 16, "pmpbtnOn");
+NexButton nxtPumpBtnOFF = NexButton(1, 17, "pmpbtnOff");
+NexButton nxtPumpBtnA = NexButton(1, 18, "pmpbtnA");
+
+NexTouch *to_listen[] = {
+    &nxtLight1BtnON, &nxtLight1BtnOFF, &nxtLight1BtnA,
+    &nxtLight2BtnON, &nxtLight2BtnOFF,&nxtLight2BtnA,
+    &nxtLight3BtnON, &nxtLight3BtnOFF,&nxtLight3BtnA,
+    &nxtPumpBtnON, &nxtPumpBtnOFF, &nxtPumpBtnA
+};
+
+String getLampsCond(){
+    return "Освещение: " + (String)(isLighting ? "ВКЛ" : "ВЫКЛ");
+}
+
+// returns condition of the specified lamp(1,2,3)
+String getLampCond(int num){
+    bool lampCond = isLighting;
+    if(!manuallyLampsWork){
+        switch(num){
+            case 1:
+                lampCond = manuallyLightON1;
+                break;
+            case 2:
+                lampCond = manuallyLightON2;
+                break;
+            default:
+                lampCond = manuallyLightON3;
+                break;
+        }
+    }
+    return "Лампа: " + (String)num +" " + (lampCond ? "ВКЛ" : "ВЫКЛ");
+}
+
+String getFloaterCond(){
+    return "Уровень воды: " + (String)(analogRead(floater) >= 1000 ? "Высок" : "Низк");
+}
+
+String isNorm(float curr, float min, float max){
+    return (String)" "+(min < curr && curr < max ? "норма" : "отклонение от нормы");
+}
+
+String getTempAndHummCond(){
+    return "Температура: " + (String)temp + isNorm(temp, tempMin, tempMax)+"\nВлажность: " + (String)humm + isNorm(temp, hummMin, hummMax);
+}
+
+String getWatering(){
+    return "Полив: " + (String)(isWatering ? "ВКЛ" : "ВЫКЛ");
+}
+
+String getLighting(){
+    return "Свет: " + (String)light_level;
+}
+
+String getCO2(){
+    return "CO2: "+(String)co2Level;
+}
+
+// включение ламп по номеру их пина
+void lampON(int lampNum) {
+    isLighting = true;
+    digitalWrite(lampNum, LOW);
+}
+
+// выключение ламп по номеру их пина
+void lampOFF(int lampNum) {
+    digitalWrite(lampNum, HIGH);
+    isLighting = false;
+}
+
+// проверка температуры
+void controlTemp() {
+    humm = dht.readHumidity();
+    temp = dht.readTemperature();
+}
+
+//автоматическое управление лампами. прописываем условия
+void controlLamp() {
+    int light = analogRead(photoresistor);
+    int light_level = map(light, 0, 1023, 255, 0);
+    // if light level less then 100 => turn lamps on
+    // check lamp 1 condition
+    if (manuallyLightON1) {
+        lampON(lamp1);
+    }
+    if (manuallyLightOFF1) {
+        lampOFF(lamp1);
+    }
+    // check lamp 2 condition
+    if (manuallyLightON2) {
+        lampON(lamp2);
+    }
+    if (manuallyLightOFF2) {
+        lampOFF(lamp2);
+    }
+    // check lamp 3 condition
+    if (manuallyLightON3) {
+        lampON(lamp3);
+    }
+    if (manuallyLightOFF3) {
+        lampOFF(lamp3);
+    }
+    // if lamps work in auto mode
+    if (manuallyLampsWork) {
+        int hours = rtc.Hours;
+        if (light_level < 100 || (hours >= 0 && hours <= 6)) {
+            lampON(lamp1);
+            lampON(lamp2);
+            lampON(lamp3);
+        } else {
+            lampOFF(lamp1);
+            lampOFF(lamp2);
+            lampOFF(lamp3);
+        }
+        delay(100);
+    }
+}
+
+// мониторинг и управление данными СО2
+void controlCO2() {
+    long tt = millis();
+    int myVal = digitalRead(co2);
+
+    if (myVal == HIGH) {
+        if (myVal != prevVal) {
+            h = tt;
+            tl = h - l;
+            prevVal = myVal;
+        }
+    } else {
+        if (myVal != prevVal) {
+            l = tt;
+            th = l - h;
+            prevVal = myVal;
+            co2Level = 5000 * (th - 2) / (th + tl - 4);
+        }
+    }
+}
+
+// мониторинг и управление данными насоса
+void controlPump() {
+    if (manuallyPumpON || manuallyPumpOFF) {
+        if (manuallyPumpON) {
+            digitalWrite(pump, LOW);
+        }
+        if (manuallyPumpOFF) {
+            digitalWrite(pump, HIGH);
+        }
+    } else {
+        long time = millis();
+        if (time > TempDelayTime) {
+            TempWateringTime = (time + wateringTime);
+            TempDelayTime += (delayTime + wateringTime);
+            isWatering = true;
+        }
+        if ((time - TempWateringTime < 0) && isWatering) {
+            digitalWrite(pump, LOW);
+        } else {
+            isWatering = false;
+            digitalWrite(pump, HIGH);
+        }
+    }
+}
+
+// выводит в консоль собранные данные
+void debug() {
+    Serial.println(getTempAndHummCond());
+    Serial.println(getLampsCond());
+    Serial.println(getLampCond(1));
+    Serial.println(getLampCond(2));
+    Serial.println(getLampCond(3));
+    Serial.println(getWatering());
+    Serial.println(getFloaterCond());
+    Serial.println(getLighting());
+    Serial.println(getCO2());
+    Serial.println(rtc.gettime(timePattern));
+}
+
+// главная функция для опроса управления всеми датчиками
+void control() {
+    controlTemp();
+    controlCO2();
+    controlLamp();
+    controlPump();
+}
+
+// Updates text on display
+void updateDisplay(void *ptr) {
+//  static char temperatureCTemp[6];
+//  dtostrf(t, 6, 2, temperatureCTemp);
+//  char charBuf[50]; -> string to char array
+//  stringOne.toCharArray(charBuf, 50)
+  //tTempC.setText(temperatureCTemp);
+}
+
+void printOnDisplay(){
+}
+
+// triggers when the sensor button releases (for 2 lams and pump)
+void buttonOn(void *ptr){
+
+}
+void buttonOff(void *ptr){
+
+}
+void buttonAuto(void *ptr){
+    
+}
+
+void bindButtons(){
+    // 1 param is trigger function which handle button action 
+    // 2 param is pointer to current button
+    nxtLight1BtnON.attachPop(buttonOn, &nxtLight1BtnON);
+    nxtLight1BtnOFF.attachPop(buttonOff, &nxtLight1BtnOFF);
+    nxtLight1BtnA.attachPop(buttonAuto, &nxtLight1BtnA);
+
+    nxtLight2BtnON.attachPop(buttonOn, &nxtLight2BtnON);
+    nxtLight2BtnOFF.attachPop(buttonOff, &nxtLight2BtnOFF);
+    nxtLight2BtnA.attachPop(buttonAuto, &nxtLight2BtnA);
+    
+    nxtLight3BtnON.attachPop(buttonOn, &nxtLight3BtnON);
+    nxtLight3BtnOFF.attachPop(buttonOff, &nxtLight3BtnOFF);
+    nxtLight3BtnA.attachPop(buttonAuto, &nxtLight3BtnA);
+
+    nxtPumpBtnON.attachPop(buttonOn, &nxtPumpBtnON);
+    nxtPumpBtnOFF.attachPop(buttonOff, &nxtPumpBtnOFF);
+    nxtPumpBtnA.attachPop(buttonAuto, &nxtPumpBtnA);
+}
+
+// настройка всего окружения (адруино и всей установки)
+void setup() {
+    Serial.begin(9600);
+    for (int i = 2; i <= 13; i++) {
+        pinMode(i, OUTPUT);
+        digitalWrite(i, LOW);
+    }
+    // init nextion and bind buttons
+    nexInit();
+    bindButtons();
+
+    pinMode(co2, INPUT);
+    pinMode(floater, INPUT_PULLUP);
+    dht.begin();
+    rtc.begin();
+    rtc.settime(0, 30, 18, 12, 6, 20, 5); // 0  сек, 30 мин, 18 часов, 12, июня, 2020, четверг
+}
+
+void loop() {
+    control();
+    debug();
+    // nextion update loop
+    nexLoop(to_listen);
+}
+
+
+// Nextion
+// https://randomnerdtutorials.com/nextion-display-with-arduino-getting-started/
+// https://diyi0t.com/arduino-nextion-display-tutorial/
+// https://3d-diy.ru/wiki/arduino-displei/nextion-displey/
+// https://nextion.tech/nextion-editor/
+// https://github.com/itead/ITEADLIB_Arduino_Nextion - Nextion git repository
